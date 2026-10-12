@@ -1,0 +1,77 @@
+name: Build Unsigned iOS IPA for Sideloadly
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Allows manual trigger button from GitHub Actions UI
+
+jobs:
+  build-ios:
+    name: Build Unsigned iOS Release IPA
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Verify Flutter & Xcode Environment
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: |
+          if [ -d "smooth_camera_app" ]; then
+            cd smooth_camera_app
+          fi
+          flutter pub get
+
+      - name: Build unsigned iOS release bundle
+        run: |
+          if [ -d "smooth_camera_app" ]; then
+            cd smooth_camera_app
+          fi
+          # Build release .app bundle without requiring an Apple Developer Certificate
+          flutter build ios --release --no-codesign
+
+      - name: Package Payload and create IPA for Sideloadly
+        run: |
+          if [ -d "smooth_camera_app" ]; then
+            cd smooth_camera_app
+          fi
+          BUILD_DIR="build/ios/iphoneos"
+
+          # Clean previous packaging
+          rm -rf Payload smooth_camera_unsigned.ipa
+
+          # Create Payload directory required by the iOS IPA standard
+          mkdir -p Payload
+
+          # Copy Runner.app into Payload as smooth_camera.app
+          cp -R "$BUILD_DIR/Runner.app" Payload/smooth_camera.app
+
+          # Compress Payload into unsigned .ipa archive
+          zip -r -y smooth_camera_unsigned.ipa Payload
+
+          echo "Payload and IPA package created successfully:"
+          ls -la Payload
+          ls -lh smooth_camera_unsigned.ipa
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smooth-camera-unsigned-ipa
+          path: |
+            smooth_camera_unsigned.ipa
+            smooth_camera_app/smooth_camera_unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

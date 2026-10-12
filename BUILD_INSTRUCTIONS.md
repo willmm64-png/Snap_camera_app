@@ -1,6 +1,6 @@
-# Smooth Camera App – CI/CD Build & Sideloading Guide
+# Smooth Camera App – GitHub Actions Build & Sideloading Guide
 
-This document outlines the project architecture and provides step-by-step instructions for configuring a **Codemagic CI/CD workflow** to build an unsigned iOS application bundle (`Payload/smooth_camera.app`) and package it into an `.ipa` for installation on Windows via **Sideloadly**.
+This guide outlines the project architecture and provides step-by-step instructions for using **GitHub Actions** to automatically build an unsigned iOS application bundle (`Payload/smooth_camera.app`) and package it into an `.ipa` file for installation on Windows via **Sideloadly**.
 
 ---
 
@@ -8,149 +8,165 @@ This document outlines the project architecture and provides step-by-step instru
 
 ```
 ios_snap_smoth_camera/
+├── .github/
+│   └── workflows/
+│       └── build-ipa.yml               # GitHub Actions CI workflow script
 ├── BUILD_INSTRUCTIONS.md               # This build & deployment guide
-├── codemagic.yaml                      # Automated Codemagic build script
 └── smooth_camera_app/                  # Flutter application root
-    ├── codemagic.yaml                  # Local copy for direct root repository builds
-    ├── pubspec.yaml                    # Dependencies (camera, gal) & shader mapping
+    ├── .github/workflows/build-ipa.yml # Local copy for subfolder repository root
+    ├── pubspec.yaml                    # camera, gal & shaders/skin_smooth.frag
     ├── shaders/
-    │   └── skin_smooth.frag            # GLSL bilateral/surface blur fragment shader
+    │   └── skin_smooth.frag            # Bilateral filter GLSL fragment shader
     ├── ios/
     │   └── Runner/
-    │       └── Info.plist              # NSCamera & NSPhotoLibrary permission keys
+    │       └── Info.plist              # NSCamera & NSPhotoLibrary permissions
     ├── lib/
     │   ├── main.dart                   # Entry point, system overlays & dark camera theme
     │   ├── camera_controller.dart      # Camera lifecycle, stream coordinates, zoom, capture
     │   ├── shader_camera_preview.dart  # Real-time GPU shader preview & CustomPainter
     │   ├── skin_smooth_processor.dart  # Offline GPU bilateral filtering on captured bytes
-    │   └── camera_screen.dart          # iOS Camera UI (19:9 ratio, grid, zoom, shutter, drawer)
+    │   └── camera_screen.dart          # 19:9 iOS Camera UI (grid, zoom bar, shutter, drawer)
     └── test/
         ├── processor_test.dart         # Unit tests for image shader processing
         └── widget_test.dart            # Smoke tests for app bootstrap
 ```
 
 ### Core Components
-* **Real-time Fragment Shader (`shaders/skin_smooth.frag`)**: GLSL 460 bilateral filter compiled into SPIR-V by Flutter's asset-based shader pipeline. Features uniform resolution, dynamic blur intensity, and photometric Gaussian weighting to smooth skin tones while preserving eyes, eyebrows, and hair edges.
+* **Real-time Fragment Shader (`shaders/skin_smooth.frag`)**: GLSL 460 bilateral filter compiled into SPIR-V by Flutter's asset-based shader pipeline. Uses photometric Gaussian weighting to smooth skin tones while preserving sharp facial features (eyes, eyebrows, eyelashes, hair).
 * **Live Camera Viewport (`lib/shader_camera_preview.dart`)**: Piped through `ui.ImageFilter.shader` using Flutter's Impeller GPU backend on iOS for hardware-accelerated 60/120 FPS rendering.
 * **High-Resolution Filter Processing (`lib/skin_smooth_processor.dart`)**: Applies `skin_smooth.frag` to raw still photos using an offline `ui.PictureRecorder` and `ui.Canvas` before saving.
-* **iOS Camera Roll Storage (`lib/camera_controller.dart`)**: Integrates the `gal` package to request photo permissions on startup and save captured images cleanly via `Gal.putImageBytes`.
-* **iOS Interface Layout (`lib/camera_screen.dart`)**: Authentic iOS camera design featuring a **19:9** viewfinder, rule-of-thirds grid, `.5`, `1`, `2x`, `5` zoom pills, mode strip, concentric shutter button, and an expandable camera controls drawer.
+* **iOS Camera Roll Storage (`lib/camera_controller.dart`)**: Uses the `gal` package to request photo permissions on startup and save captured images cleanly via `Gal.putImageBytes`.
+* **iOS Interface Layout (`lib/camera_screen.dart`)**: Replicates the iOS Camera interface with a **19:9** viewfinder, rule-of-thirds grid, `.5`, `1`, `2x`, `5` zoom pills, mode strip, concentric shutter button, and an expandable camera controls drawer.
 
 ---
 
-## 2. GitHub Repository Setup
+## 2. GitHub Actions Workflow Configuration (`.github/workflows/build-ipa.yml`)
 
-To allow Codemagic to build the app, push your codebase to GitHub:
+GitHub provides free macOS runners (`macos-latest`) capable of compiling Flutter iOS applications. Because you will sign the app on Windows using Sideloadly with your personal Apple ID, the workflow builds an **unsigned release bundle** using `--no-codesign`, packages it into `Payload/smooth_camera.app`, and zips it into `smooth_camera_unsigned.ipa`.
 
-```bash
-# In the project root (c:\Users\metz-\Desktop\code\ios_snap_smoth_camera)
-git init
-git add .
-git commit -m "Initial commit of smooth camera app with bilateral shader"
-
-# Link to your GitHub repository
-git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo-name>.git
-git push -u origin main
-```
-
----
-
-## 3. Codemagic Workflow Configuration (`codemagic.yaml`)
-
-Codemagic provides free macOS build instances capable of compiling Flutter iOS applications. Because you will sign the app on Windows using Sideloadly with your personal Apple ID, the workflow builds an **unsigned release bundle** using `--no-codesign`, packages it into `Payload/smooth_camera.app`, and zips it into `smooth_camera_unsigned.ipa`.
-
-Here is the exact `codemagic.yaml` specification:
+Here is the workflow script configured in [`.github/workflows/build-ipa.yml`](.github/workflows/build-ipa.yml):
 
 ```yaml
-workflows:
-  ios-unsigned-release:
-    name: Build Unsigned iOS Release for Sideloadly
-    max_build_duration: 30
-    instance_type: mac_mini_m2
-    environment:
-      flutter: stable
-      xcode: latest
-      cocoapods: default
-    scripts:
-      - name: Set up Flutter environment & dependencies
-        script: |
-          # Navigate to project subfolder if repository contains root container
+name: Build Unsigned iOS IPA for Sideloadly
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Allows manual trigger button from GitHub Actions UI
+
+jobs:
+  build-ios:
+    name: Build Unsigned iOS Release IPA
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Verify Flutter & Xcode Environment
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: |
           if [ -d "smooth_camera_app" ]; then
             cd smooth_camera_app
           fi
-          echo "Flutter SDK version:"
-          flutter --version
           flutter pub get
 
       - name: Build unsigned iOS release bundle
-        script: |
+        run: |
           if [ -d "smooth_camera_app" ]; then
             cd smooth_camera_app
           fi
-          # Build release .app without requiring an Apple Developer Certificate
+          # Build release .app bundle without requiring an Apple Developer Certificate
           flutter build ios --release --no-codesign
 
-      - name: Package Payload and generate .ipa for Sideloadly
-        script: |
+      - name: Package Payload and create IPA for Sideloadly
+        run: |
           if [ -d "smooth_camera_app" ]; then
             cd smooth_camera_app
           fi
-          # Locate built application bundle
           BUILD_DIR="build/ios/iphoneos"
-          
+
           # Clean previous packaging
           rm -rf Payload smooth_camera_unsigned.ipa
-          
+
           # Create Payload directory required by the iOS IPA standard
           mkdir -p Payload
-          
+
           # Copy Runner.app into Payload as smooth_camera.app
           cp -R "$BUILD_DIR/Runner.app" Payload/smooth_camera.app
-          
-          # Compress Payload folder into unsigned .ipa archive
+
+          # Compress Payload into unsigned .ipa archive
           zip -r -y smooth_camera_unsigned.ipa Payload
-          
+
           echo "Payload and IPA package created successfully:"
           ls -la Payload
           ls -lh smooth_camera_unsigned.ipa
 
-    artifacts:
-      - smooth_camera_app/smooth_camera_unsigned.ipa
-      - smooth_camera_unsigned.ipa
-      - smooth_camera_app/Payload/**
-      - Payload/**
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smooth-camera-unsigned-ipa
+          path: |
+            smooth_camera_unsigned.ipa
+            smooth_camera_app/smooth_camera_unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
 ```
 
 ---
 
-## 4. Codemagic Web Setup (Step-by-Step)
+## 3. GitHub Repository Setup & Triggering the Build
 
-1. **Sign up / Log in to Codemagic**:
-   - Go to [codemagic.io](https://codemagic.io) and log in with your GitHub account.
-2. **Add Your Repository**:
-   - Navigate to **Applications** > **Add application**.
-   - Select **GitHub** as the Git provider and select your `ios_snap_smoth_camera` repository.
-   - Select **Flutter App** as the project type.
-3. **Select `codemagic.yaml`**:
-   - In the application settings, select **codemagic.yaml** as the workflow configuration method.
-4. **Trigger Build**:
-   - Click **Start new build**.
-   - Select the `main` branch and select the `ios-unsigned-release` workflow.
-   - Click **Start build**.
-5. **Download the Artifact**:
-   - Once the build succeeds (~5–8 minutes), scroll to the **Artifacts** section at the bottom of the build page.
-   - Download **`smooth_camera_unsigned.ipa`** (or the zipped `Payload/` folder).
+1. **Initialize Git and Push to GitHub**:
+   ```bash
+   # From the project root (c:\Users\metz-\Desktop\code\ios_snap_smoth_camera)
+   git init
+   git add .
+   git commit -m "Add iOS camera app with GitHub Actions IPA build workflow"
+
+   # Link your GitHub repository
+   git branch -M main
+   git remote add origin https://github.com/<your-username>/<your-repo-name>.git
+   git push -u origin main
+   ```
+
+2. **Trigger the Workflow on GitHub**:
+   - Pushing to `main` automatically triggers the build.
+   - Alternatively, trigger it manually:
+     1. Open your repository on **github.com**.
+     2. Click on the **Actions** tab.
+     3. In the left sidebar, click **Build Unsigned iOS IPA for Sideloadly**.
+     4. Click **Run workflow** > select branch `main` > click **Run workflow**.
+
+3. **Download the Compiled `.ipa`**:
+   - Once the workflow completes (~6–10 minutes, marked with a green checkmark):
+   - Click on the completed workflow run.
+   - Scroll down to the **Artifacts** section at the bottom.
+   - Click **`smooth-camera-unsigned-ipa`** to download the zip containing `smooth_camera_unsigned.ipa`.
+   - Extract the downloaded zip file on your Windows machine to obtain `smooth_camera_unsigned.ipa`.
 
 ---
 
-## 5. Sideloading via Sideloadly on Windows
+## 4. Sideloading via Sideloadly on Windows
 
 [Sideloadly](https://sideloadly.io/) allows you to sign and install any `.ipa` file onto an iOS device directly from a Windows PC using a free personal Apple ID.
 
 ### Prerequisites on Windows:
-* **iTunes**: Download the direct desktop version from [Apple](https://www.apple.com/itunes/) (do **not** install the Microsoft Store version, as it lacks mobile device drivers).
-* **iCloud**: Download the direct desktop version from Apple or ensure Apple Mobile Device Support is running.
+* **iTunes**: Download the standalone desktop version from [Apple](https://www.apple.com/itunes/) (do **not** install the Microsoft Store version, as it lacks mobile device drivers).
+* **iCloud**: Download the standalone desktop version from Apple or ensure Apple Mobile Device Support is running.
 * **Sideloadly**: Download and install from [sideloadly.io](https://sideloadly.io/).
 
 ### Installation Steps:
@@ -171,7 +187,7 @@ workflows:
 
 ---
 
-## 6. First-Time Setup on iOS (iOS 16, 17, and 18+)
+## 5. First-Time Setup on iOS (iOS 16, 17, and 18+)
 
 Before the app can run on your iPhone:
 
@@ -192,7 +208,7 @@ Before the app can run on your iPhone:
 
 ---
 
-## 7. Troubleshooting & Notes
+## 6. Troubleshooting & Notes
 
 | Issue | Cause | Resolution |
 | :--- | :--- | :--- |
@@ -200,4 +216,4 @@ Before the app can run on your iPhone:
 | **App crashes on startup on iOS** | Missing usage descriptions in `Info.plist` | Verified: `NSCameraUsageDescription` and `NSPhotoLibraryAddUsageDescription` are already configured in `ios/Runner/Info.plist`. |
 | **"Developer Mode Required"** | iOS 16+ security policy | Enable Developer Mode under `Settings > Privacy & Security > Developer Mode`. |
 | **7-Day Expiration** | Free Apple ID provisioning profile duration | Sideloaded apps signed with a free Apple ID remain valid for 7 days. Reconnect to Windows and click **Start** in Sideloadly to refresh the profile without losing app data. |
-| **Shader Compilation on Device** | Impeller GPU compiler | `shaders/skin_smooth.frag` is compiled ahead-of-time by Flutter's asset toolchain and runs with full Impeller GPU hardware acceleration on iOS. |
+| **GitHub Actions runner timeout** | First run cache warming | Runner timeout is set to 45 minutes with Flutter cache enabled. Subsequent builds finish in ~5–7 minutes. |
