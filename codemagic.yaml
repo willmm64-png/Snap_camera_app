@@ -1,0 +1,45 @@
+workflows:
+  ios-unsigned-release:
+    name: Build Unsigned iOS Release for Sideloadly
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Set up Flutter environment & dependencies
+        script: |
+          if [ -d "smooth_camera_app" ]; then
+            cd smooth_camera_app
+          fi
+          echo "Flutter SDK version:"
+          flutter --version
+          flutter pub get
+
+      - name: Build unsigned iOS release bundle
+        script: |
+          if [ -d "smooth_camera_app" ]; then
+            cd smooth_camera_app
+          fi
+          flutter build ios --release --no-codesign
+
+      - name: Package Payload and generate .ipa for Sideloadly
+        script: |
+          if [ -d "smooth_camera_app" ]; then
+            cd smooth_camera_app
+          fi
+          BUILD_DIR="build/ios/iphoneos"
+          rm -rf Payload smooth_camera_unsigned.ipa
+          mkdir -p Payload
+          cp -R "$BUILD_DIR/Runner.app" Payload/smooth_camera.app
+          zip -r -y smooth_camera_unsigned.ipa Payload
+          echo "Payload and IPA archive ready:"
+          ls -la Payload
+          ls -lh smooth_camera_unsigned.ipa
+
+    artifacts:
+      - smooth_camera_app/smooth_camera_unsigned.ipa
+      - smooth_camera_unsigned.ipa
+      - smooth_camera_app/Payload/**
+      - Payload/**
