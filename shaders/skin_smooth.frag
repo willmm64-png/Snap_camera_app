@@ -1,77 +1,132 @@
 #version 460 core
 #include <flutter/runtime_effect.glsl>
 
-// Uniforms ordered for Flutter's FragmentShader:
-// Floats/vectors first, followed by samplers.
-uniform vec2 uResolution;      // Output viewport resolution (width, height) in pixels
-uniform float uIntensity;      // Smoothing intensity, typically in range [0.0, 1.0]
-uniform sampler2D uTexture;    // Camera feed or image texture
+// Float uniforms first (float indices 0..3), then samplers.
+uniform vec2 uResolution;   // float idx 0,1: output size (width, height)
+uniform float uIntensity;   // float idx 2: smoothing + blemish removal, 0..1
+uniform float uTan;         // float idx 3: tan amount, 0..1
+uniform sampler2D uTexture; // camera frame or photo
 
 out vec4 fragColor;
 
-// Spatial and photometric constants for bilateral filtering
-const int RADIUS = 4;
-const float SPATIAL_SIGMA = 3.5;
-// RANGE_SIGMA defines color distance tolerance:
-// Pixels within this color distance are blurred (skin tones);
-// pixels with larger distance (edges: eyes, hair, eyebrows) are preserved.
-const float RANGE_SIGMA = 0.14;
+// ---------------- Tuning constants ----------------
+// Kernel size is a fraction of image HEIGHT so preview and full-res photo
+// look the same (old code used 1 pixel steps, so photos were barely smoothed).
+const int   RADIUS = 4;
+const float KERNEL_UNIT = 0.0016;   // one kernel step = 0.16% of image height
+const float SPATIAL_SIGMA = 2.6;
+const float RANGE_SIGMA = 0.09;     // lower = more precise edges (eyes/hair/lips kept)
+const float DETAIL_KEEP = 0.20;     // fraction of fine skin texture kept (pores)
+
+// Blemish (red spot) removal: how much redder than surrounding skin.
+const float SPOT_LOW = 0.025;       // below this = ignored
+const float SPOT_HIGH = 0.055;      // above this = fully treated
+const float SPOT_MAX_LOW = 0.07;    // above this fades out again (protects lips)
+const float SPOT_MAX_HIGH = 0.10;
+
+// Tan: multiplies skin by a warm tint. Strength comes from uTan.
+const vec3 TAN_TINT = vec3(0.95, 0.86, 0.74);
+
+vec2 chroma(vec3 c) {
+    float cb = 0.5 - 0.168736 * c.r - 0.331264 * c.g + 0.5 * c.b;
+    float cr = 0.5 + 0.5 * c.r - 0.418688 * c.g - 0.081312 * c.b;
+    return vec2(cb, cr);
+}
+
+// Soft 0..1 skin mask from YCbCr chroma range. Works for light and dark skin.
+float skinMask(vec3 c) {
+    vec2 cc = chroma(c);
+    float luma = dot(c, vec3(0.299, 0.587, 0.114));
+    float mCb = smoothstep(0.28, 0.32, cc.x) * (1.0 - smoothstep(0.48, 0.52, cc.x));
+    float mCr = smoothstep(0.50, 0.54, cc.y) * (1.0 - smoothstep(0.69, 0.74, cc.y));
+    float mL = smoothstep(0.10, 0.20, luma);
+    return mCb * mCr * mL;
+}
 
 void main() {
     vec2 fragCoord = FlutterFragCoord().xy;
     vec2 uv = fragCoord / uResolution;
 
-    vec4 centerColor = texture(uTexture, uv);
+    vec4 centerSample = texture(uTexture, uv);
+    vec3 centerRaw = centerSample.rgb;
+    float mask = skinMask(centerRaw);
+    float intensity = clamp(uIntensity, 0.0, 1.0);
 
-    // Bypass filter if intensity is essentially zero
-    if (uIntensity <= 0.001) {
-        fragColor = centerColor;
-        return;
-    }
+    // Kernel step in uv units, equal in pixels on both axes.
+    float aspect = uResolution.y / uResolution.x;
+    vec2 unit = vec2(KERNEL_UNIT * aspect, KERNEL_UNIT);
 
-    vec2 texelSize = 1.0 / uResolution;
-    // Step size scales dynamically with blur intensity
-    float stepScale = 1.0 + clamp(uIntensity, 0.0, 1.0) * 1.2;
+    vec3 color = centerRaw;
 
-    float twoSpatialSigma2 = 2.0 * SPATIAL_SIGMA * SPATIAL_SIGMA;
-    // Range sigma widens slightly with higher intensity for stronger smoothing
-    float dynamicRangeSigma = RANGE_SIGMA * (0.8 + 0.6 * clamp(uIntensity, 0.0, 1.0));
-    float twoRangeSigma2 = 2.0 * dynamicRangeSigma * dynamicRangeSigma;
-
-    vec3 sumColor = vec3(0.0);
-    float sumWeight = 0.0;
-
-    // Sample neighboring pixels within a circular kernel of radius RADIUS
-    for (int x = -RADIUS; x <= RADIUS; ++x) {
-        for (int y = -RADIUS; y <= RADIUS; ++y) {
-            float dSpatial2 = float(x * x + y * y);
-            // Prune corners to maintain an isotropic circular filter kernel
-            if (dSpatial2 > float(RADIUS * RADIUS) + 0.5) {
-                continue;
+    if (intensity > 0.001 && mask > 0.01) {
+        // ---- 1. Blemish removal ----
+        // Average skin colour in two rings around the pixel (skin-like samples only).
+        vec3 ringSum = vec3(0.0);
+        float ringW = 0.0;
+        for (int ring = 0; ring < 2; ++ring) {
+            float ringRadius = (ring == 0) ? 6.0 : 10.0;
+            for (int i = 0; i < 8; ++i) {
+                float a = float(i) * 0.785398;
+                vec2 dir = vec2(cos(a), sin(a));
+                vec3 s = texture(uTexture, uv + dir * unit * ringRadius).rgb;
+                float m = skinMask(s);
+                ringSum += s * m;
+                ringW += m;
             }
-
-            vec2 offset = vec2(float(x), float(y)) * texelSize * stepScale;
-            vec4 sampleColor = texture(uTexture, uv + offset);
-
-            // Compute Euclidean color distance in RGB space
-            vec3 colorDiff = sampleColor.rgb - centerColor.rgb;
-            float dColor2 = dot(colorDiff, colorDiff);
-
-            // Bilateral weight: product of spatial Gaussian and color distance Gaussian
-            float spatialWeight = exp(-dSpatial2 / twoSpatialSigma2);
-            float rangeWeight = exp(-dColor2 / twoRangeSigma2);
-            float weight = spatialWeight * rangeWeight;
-
-            sumColor += sampleColor.rgb * weight;
-            sumWeight += weight;
         }
+
+        vec3 healed = centerRaw;
+        if (ringW > 4.0) {
+            vec3 localSkin = ringSum / ringW;
+            float redness = chroma(centerRaw).y - chroma(localSkin).y;
+            float spot = smoothstep(SPOT_LOW, SPOT_HIGH, redness)
+                       * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness));
+            float healAmount = clamp(intensity * 1.3, 0.0, 1.0);
+            healed = mix(centerRaw, localSkin, spot * healAmount);
+        }
+
+        // ---- 2. Edge-preserving smoothing (bilateral) ----
+        float stepScale = 1.0 + intensity * 1.2;
+        float twoSpatialSigma2 = 2.0 * SPATIAL_SIGMA * SPATIAL_SIGMA;
+        float dynRange = RANGE_SIGMA * (0.8 + 0.6 * intensity);
+        float twoRangeSigma2 = 2.0 * dynRange * dynRange;
+
+        vec3 sumColor = vec3(0.0);
+        float sumWeight = 0.0;
+
+        for (int x = -RADIUS; x <= RADIUS; ++x) {
+            for (int y = -RADIUS; y <= RADIUS; ++y) {
+                float d2 = float(x * x + y * y);
+                if (d2 > float(RADIUS * RADIUS) + 0.5) {
+                    continue;
+                }
+                vec2 offset = vec2(float(x), float(y)) * unit * stepScale;
+                vec3 s = texture(uTexture, uv + offset).rgb;
+                vec3 diff = s - healed;
+                float w = exp(-d2 / twoSpatialSigma2)
+                        * exp(-dot(diff, diff) / twoRangeSigma2);
+                sumColor += s * w;
+                sumWeight += w;
+            }
+        }
+
+        vec3 smoothed = sumColor / max(sumWeight, 0.0001);
+
+        // Keep a little fine texture so skin does not look plastic.
+        smoothed += (healed - smoothed) * DETAIL_KEEP;
+
+        // Apply to skin only.
+        color = mix(centerRaw, smoothed, intensity * mask);
     }
 
-    // Normalized bilateral filtered color
-    vec3 blurredColor = sumColor / max(sumWeight, 0.0001);
+    // ---- 3. Tan (skin only) ----
+    float tanAmount = clamp(uTan, 0.0, 1.0);
+    if (tanAmount > 0.001 && mask > 0.01) {
+        vec3 target = color * TAN_TINT;
+        float l = dot(target, vec3(0.2126, 0.7152, 0.0722));
+        target = mix(vec3(l), target, 1.1);   // slight saturation boost
+        color = mix(color, target, tanAmount * mask);
+    }
 
-    // Smoothly blend filtered result with original based on intensity
-    vec3 finalColor = mix(centerColor.rgb, blurredColor, clamp(uIntensity, 0.0, 1.0));
-
-    fragColor = vec4(finalColor, centerColor.a);
+    fragColor = vec4(clamp(color, 0.0, 1.0), centerSample.a);
 }

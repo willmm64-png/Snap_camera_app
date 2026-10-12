@@ -34,6 +34,7 @@ class SmoothCameraController extends ChangeNotifier {
   List<CameraDescription> _availableCameras = [];
   CameraDescription? _frontCamera;
   bool _isInitializing = false;
+  bool _isSwitchingLens = false;
   String? _errorMessage;
 
   // Stream piping live camera coordinate updates into custom painter / FragmentShader
@@ -42,6 +43,7 @@ class SmoothCameraController extends ChangeNotifier {
 
   // Smoothing filter intensity uniform: [0.0 (off) .. 1.0 (maximum)]
   double _smoothIntensity = 0.75;
+  final double _tanAmount = 0.35;
 
   // Zoom control
   double _currentZoom = 1.0;
@@ -71,6 +73,7 @@ class SmoothCameraController extends ChangeNotifier {
   bool get isInitializing => _isInitializing;
   String? get errorMessage => _errorMessage;
   double get smoothIntensity => _smoothIntensity;
+  double get tanAmount => _tanAmount;
   CameraDescription? get currentCamera => _frontCamera;
   double get currentZoom => _currentZoom;
   double get minZoom => _minZoom;
@@ -78,6 +81,9 @@ class SmoothCameraController extends ChangeNotifier {
   FlashMode get flashMode => _flashMode;
   String get formatMode => _formatMode;
   bool get showGrid => _showGrid;
+  bool get flashOn => _flashMode != FlashMode.off;
+  bool get isFrontCamera =>
+      _frontCamera?.lensDirection == CameraLensDirection.front;
   String get selectedMode => _selectedMode;
   String get aspectRatioMode => _aspectRatioMode;
   Uint8List? get lastThumbnailBytes => _lastThumbnailBytes;
@@ -161,25 +167,22 @@ class SmoothCameraController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Cycle flash mode: off -> auto -> always -> off
+  /// Flash is simply off or on (always).
   Future<void> toggleFlash() async {
     if (!isInitialized || _controller == null) return;
+    _flashMode =
+        _flashMode == FlashMode.off ? FlashMode.always : FlashMode.off;
+    await _applyFlashMode();
+    notifyListeners();
+  }
+
+  /// Front camera has no hardware flash on iPhone, so skip it there
+  /// (the UI uses a white screen flash instead).
+  Future<void> _applyFlashMode() async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+    if (isFrontCamera) return;
     try {
-      FlashMode nextMode;
-      switch (_flashMode) {
-        case FlashMode.off:
-          nextMode = FlashMode.auto;
-          break;
-        case FlashMode.auto:
-          nextMode = FlashMode.always;
-          break;
-        default:
-          nextMode = FlashMode.off;
-          break;
-      }
-      await _controller!.setFlashMode(nextMode);
-      _flashMode = nextMode;
-      notifyListeners();
+      await _controller!.setFlashMode(_flashMode);
     } catch (e) {
       debugPrint('Failed to set flash mode: $e');
     }
@@ -265,6 +268,8 @@ class SmoothCameraController extends ChangeNotifier {
       // Emit initial coordinate state
       _emitCurrentTextureCoordinates();
 
+      await _applyFlashMode();
+
       _isInitializing = false;
       notifyListeners();
     } catch (e) {
@@ -306,32 +311,55 @@ class SmoothCameraController extends ChangeNotifier {
 
   /// Switch between front and back camera lenses
   Future<void> toggleCameraLens() async {
+    if (_isSwitchingLens || _isInitializing) return;
     if (_availableCameras.length < 2 || _controller == null) return;
+    _isSwitchingLens = true;
+    try {
+      final newDirection =
+          _frontCamera?.lensDirection == CameraLensDirection.front
+              ? CameraLensDirection.back
+              : CameraLensDirection.front;
+      final nextCamera = _availableCameras.firstWhere(
+        (cam) => cam.lensDirection == newDirection,
+        orElse: () => _availableCameras.first,
+      );
 
-    final newDirection = _frontCamera?.lensDirection == CameraLensDirection.front
-        ? CameraLensDirection.back
-        : CameraLensDirection.front;
+      // Detach the old controller from the UI BEFORE disposing it.
+      final oldController = _controller;
+      _controller = null;
+      notifyListeners();
+      oldController?.removeListener(_onCameraControllerUpdate);
+      await oldController?.dispose();
 
-    final nextCamera = _availableCameras.firstWhere(
-      (cam) => cam.lensDirection == newDirection,
-      orElse: () => _availableCameras.first,
-    );
+      _frontCamera = nextCamera;
+      final newController = CameraController(
+        nextCamera,
+        ResolutionPreset.high,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.bgra8888,
+      );
+      _controller = newController;
+      await newController.initialize();
+      newController.addListener(_onCameraControllerUpdate);
 
-    _frontCamera = nextCamera;
+      try {
+        _minZoom = await newController.getMinZoomLevel();
+        _maxZoom = await newController.getMaxZoomLevel();
+        _currentZoom = _minZoom;
+      } catch (_) {
+        _minZoom = 1.0;
+        _maxZoom = 5.0;
+        _currentZoom = 1.0;
+      }
 
-    await _controller?.dispose();
-
-    _controller = CameraController(
-      nextCamera,
-      ResolutionPreset.high,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.bgra8888,
-    );
-
-    await _controller!.initialize();
-    _controller!.addListener(_onCameraControllerUpdate);
-    _emitCurrentTextureCoordinates();
-    notifyListeners();
+      await _applyFlashMode();
+      _emitCurrentTextureCoordinates();
+    } catch (e) {
+      _errorMessage = e.toString();
+    } finally {
+      _isSwitchingLens = false;
+      notifyListeners();
+    }
   }
 
   /// Capture a high-resolution photo from the camera, apply the skin_smooth.frag
@@ -353,6 +381,7 @@ class SmoothCameraController extends ChangeNotifier {
     final Uint8List processedBytes = await SkinSmoothProcessor.processImageBytes(
       rawBytes: rawBytes,
       intensity: _smoothIntensity,
+      tan: _tanAmount,
     );
 
     // 3. Ensure iOS Photos library access permissions

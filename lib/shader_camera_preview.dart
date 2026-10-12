@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:ui' as ui;
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+
 import 'camera_controller.dart';
 
 /// CustomPainter that renders with the compiled skin_smooth.frag FragmentShader
@@ -10,11 +12,13 @@ class SkinSmoothCustomPainter extends CustomPainter {
   final ui.FragmentShader? shader;
   final CameraTextureCoordinates? coordinates;
   final double intensity;
+  final double tan;
 
   SkinSmoothCustomPainter({
     required this.shader,
     required this.coordinates,
     required this.intensity,
+    required this.tan,
   });
 
   @override
@@ -27,6 +31,7 @@ class SkinSmoothCustomPainter extends CustomPainter {
 
     // Uniform 2: uIntensity (filter blur intensity [0.0 .. 1.0])
     shader!.setFloat(2, intensity);
+    shader!.setFloat(3, tan);
 
     // Create a paint with the fragment shader or shader filter
     final paint = Paint()..shader = shader;
@@ -40,6 +45,7 @@ class SkinSmoothCustomPainter extends CustomPainter {
   bool shouldRepaint(covariant SkinSmoothCustomPainter oldDelegate) {
     return oldDelegate.shader != shader ||
         oldDelegate.intensity != intensity ||
+        oldDelegate.tan != tan ||
         oldDelegate.coordinates?.timestamp != coordinates?.timestamp;
   }
 }
@@ -50,10 +56,7 @@ class SkinSmoothCustomPainter extends CustomPainter {
 class ShaderCameraPreview extends StatefulWidget {
   final SmoothCameraController cameraController;
 
-  const ShaderCameraPreview({
-    super.key,
-    required this.cameraController,
-  });
+  const ShaderCameraPreview({super.key, required this.cameraController});
 
   @override
   State<ShaderCameraPreview> createState() => _ShaderCameraPreviewState();
@@ -83,15 +86,14 @@ class _ShaderCameraPreviewState extends State<ShaderCameraPreview> {
   }
 
   void _subscribeToTextureStream() {
-    _coordsSubscription = widget.cameraController.textureCoordinatesStream.listen(
-      (coords) {
-        if (mounted) {
-          setState(() {
-            _latestCoordinates = coords;
-          });
-        }
-      },
-    );
+    _coordsSubscription = widget.cameraController.textureCoordinatesStream
+        .listen((coords) {
+          if (mounted) {
+            setState(() {
+              _latestCoordinates = coords;
+            });
+          }
+        });
   }
 
   Future<void> _loadFragmentShader() async {
@@ -128,10 +130,7 @@ class _ShaderCameraPreviewState extends State<ShaderCameraPreview> {
 
     if (!camera.isInitialized || camera.controller == null) {
       return const Center(
-        child: CircularProgressIndicator(
-          color: Colors.white,
-          strokeWidth: 2,
-        ),
+        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
       );
     }
 
@@ -139,13 +138,12 @@ class _ShaderCameraPreviewState extends State<ShaderCameraPreview> {
     final cameraAspect = controller.value.aspectRatio > 0
         ? controller.value.aspectRatio
         : (3.0 / 4.0);
-
     final rawPreview = ClipRect(
       child: FittedBox(
         fit: BoxFit.cover,
         child: SizedBox(
           width: 1000.0,
-          height: 1000.0 / cameraAspect,
+          height: 1000.0 * cameraAspect,
           child: CameraPreview(controller),
         ),
       ),
@@ -169,6 +167,7 @@ class _ShaderCameraPreviewState extends State<ShaderCameraPreview> {
         _shader!.setFloat(0, size.width);
         _shader!.setFloat(1, size.height);
         _shader!.setFloat(2, intensity);
+        _shader!.setFloat(3, camera.tanAmount);
 
         // Check for Impeller ImageFilter shader support (default on iOS)
         final isFilterSupported = ui.ImageFilter.isShaderFilterSupported;
@@ -191,6 +190,7 @@ class _ShaderCameraPreviewState extends State<ShaderCameraPreview> {
                   shader: _shader,
                   coordinates: _latestCoordinates,
                   intensity: intensity,
+                  tan: camera.tanAmount,
                 ),
               ),
             ],

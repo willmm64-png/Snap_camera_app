@@ -12,11 +12,13 @@ class SkinSmoothProcessor {
   static Future<Uint8List> processImageBytes({
     required Uint8List rawBytes,
     required double intensity,
+    double tan = 0.35,
   }) async {
     final clampedIntensity = intensity.clamp(0.0, 1.0);
+    final clampedTan = tan.clamp(0.0, 1.0);
 
     // Bypass processing if intensity is essentially zero
-    if (clampedIntensity <= 0.001) {
+    if (clampedIntensity <= 0.001 && clampedTan <= 0.001) {
       return rawBytes;
     }
 
@@ -46,6 +48,7 @@ class SkinSmoothProcessor {
       shader.setFloat(0, width);
       shader.setFloat(1, height);
       shader.setFloat(2, clampedIntensity);
+      shader.setFloat(3, clampedTan);
       shader.setImageSampler(0, sourceImage);
 
       // 4. Render to an offline canvas using PictureRecorder
