@@ -19,10 +19,16 @@ const float RANGE_SIGMA = 0.09;     // lower = more precise edges (eyes/hair/lip
 const float DETAIL_KEEP = 0.20;     // fraction of fine skin texture kept (pores)
 
 // Blemish (red spot) removal: how much redder than surrounding skin.
-const float SPOT_LOW = 0.025;       // below this = ignored
-const float SPOT_HIGH = 0.055;      // above this = fully treated
-const float SPOT_MAX_LOW = 0.07;    // above this fades out again (protects lips)
-const float SPOT_MAX_HIGH = 0.10;
+const float SPOT_LOW = 0.015;       // below this = ignored (normal skin variation)
+const float SPOT_HIGH = 0.040;      // above this = fully treated
+const float SPOT_MAX_LOW = 0.09;    // very red areas fade out (protects lips)
+const float SPOT_MAX_HIGH = 0.14;
+const float LIP_CR_LOW = 0.685;     // absolute redness above this is treated as lips
+const float LIP_CR_HIGH = 0.715;
+// Rings used to sample the surrounding skin. Radius is in kernel steps.
+// Must be bigger than the largest pimple you want removed.
+const float RING_START = 14.0;
+const float RING_STEP = 8.0;
 
 // Tan: multiplies skin by a warm tint. Strength comes from uTan.
 const vec3 TAN_TINT = vec3(0.95, 0.86, 0.74);
@@ -60,11 +66,11 @@ void main() {
 
     if (intensity > 0.001 && mask > 0.01) {
         // ---- 1. Blemish removal ----
-        // Average skin colour in two rings around the pixel (skin-like samples only).
+        // Pass A: rough average skin colour on 3 rings around the pixel.
         vec3 ringSum = vec3(0.0);
         float ringW = 0.0;
-        for (int ring = 0; ring < 2; ++ring) {
-            float ringRadius = (ring == 0) ? 6.0 : 10.0;
+        for (int ring = 0; ring < 3; ++ring) {
+            float ringRadius = RING_START + RING_STEP * float(ring);
             for (int i = 0; i < 8; ++i) {
                 float a = float(i) * 0.785398;
                 vec2 dir = vec2(cos(a), sin(a));
@@ -76,12 +82,35 @@ void main() {
         }
 
         vec3 healed = centerRaw;
-        if (ringW > 4.0) {
-            vec3 localSkin = ringSum / ringW;
-            float redness = chroma(centerRaw).y - chroma(localSkin).y;
+        if (ringW > 6.0) {
+            vec3 roughSkin = ringSum / ringW;
+            float roughCr = chroma(roughSkin).y;
+
+            // Pass B: repeat, but ignore samples that are red outliers
+            // (e.g. the rest of a big pimple), so the target is clean skin.
+            vec3 cleanSum = vec3(0.0);
+            float cleanW = 0.0;
+            for (int ring = 0; ring < 3; ++ring) {
+                float ringRadius = RING_START + RING_STEP * float(ring);
+                for (int i = 0; i < 8; ++i) {
+                    float a = float(i) * 0.785398;
+                    vec2 dir = vec2(cos(a), sin(a));
+                    vec3 s = texture(uTexture, uv + dir * unit * ringRadius).rgb;
+                    float crS = chroma(s).y;
+                    float w = skinMask(s)
+                            * (1.0 - smoothstep(0.015, 0.040, crS - roughCr));
+                    cleanSum += s * w;
+                    cleanW += w;
+                }
+            }
+
+            vec3 localSkin = (cleanW > 2.0) ? cleanSum / cleanW : roughSkin;
+            float centerCr = chroma(centerRaw).y;
+            float redness = centerCr - chroma(localSkin).y;
             float spot = smoothstep(SPOT_LOW, SPOT_HIGH, redness)
-                       * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness));
-            float healAmount = clamp(intensity * 1.3, 0.0, 1.0);
+                       * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness))
+                       * (1.0 - smoothstep(LIP_CR_LOW, LIP_CR_HIGH, centerCr));
+            float healAmount = clamp(intensity * 1.6, 0.0, 1.0);
             healed = mix(centerRaw, localSkin, spot * healAmount);
         }
 
@@ -116,7 +145,7 @@ void main() {
         smoothed += (healed - smoothed) * DETAIL_KEEP;
 
         // Apply to skin only.
-        color = mix(centerRaw, smoothed, intensity * mask);
+        color = mix(healed, smoothed, intensity * mask);
     }
 
     // ---- 3. Tan (skin only) ----
