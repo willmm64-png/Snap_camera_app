@@ -19,12 +19,17 @@ const float RANGE_SIGMA = 0.09;     // lower = more precise edges (eyes/hair/lip
 const float DETAIL_KEEP = 0.20;     // fraction of fine skin texture kept (pores)
 
 // Blemish (red spot) removal: how much redder than surrounding skin.
-const float SPOT_LOW = 0.015;       // below this = ignored (normal skin variation)
-const float SPOT_HIGH = 0.040;      // above this = fully treated
+const float SPOT_LOW = 0.008;       // below this = ignored (normal skin variation)
+const float SPOT_HIGH = 0.025;      // above this = fully treated (tuned on a pale face with faint spots)
 const float SPOT_MAX_LOW = 0.09;    // very red areas fade out (protects lips)
 const float SPOT_MAX_HIGH = 0.14;
 const float LIP_CR_LOW = 0.685;     // absolute redness above this is treated as lips
 const float LIP_CR_HIGH = 0.715;
+// Size test: a blemish is small. If the area ~9 steps around the pixel is also
+// red, it is a lip / flushed area / ear, not a blemish, and is left alone.
+const float BLOB_RADIUS = 9.0;
+const float BLOB_LOW = 0.25;
+const float BLOB_HIGH = 0.50;
 // Rings used to sample the surrounding skin. Radius is in kernel steps.
 // Must be bigger than the largest pimple you want removed.
 const float RING_START = 16.0;
@@ -38,6 +43,10 @@ const float TEXTURE_HIGH = 0.090;
 // but is more tolerant because a pimple edge also changes brightness.
 const float HEAL_TEXTURE_LOW = 0.030;
 const float HEAL_TEXTURE_HIGH = 0.060;
+
+// Dark features (brows, hair, lashes, shadow) must never leak into the
+// "clean skin" colour: that caused grey-olive patches.
+const float DARK_GAP = 0.20;        // a ring sample this much darker than the pixel counts as a dark feature
 
 // Tan: multiplies skin by a warm tint. Strength comes from uTan.
 const vec3 TAN_TINT = vec3(0.95, 0.86, 0.74);
@@ -99,9 +108,12 @@ void main() {
         // (hair, ear edge, head outline, background) this pixel is near an
         // edge of the skin area and is left alone. Brown hair and shadowed
         // ears have skin-like colour, so colour alone is not enough.
+        float l0 = dot(centerRaw, vec3(0.299, 0.587, 0.114));
         vec3 ringSum = vec3(0.0);
         float ringW = 0.0;
+        float ringLumaSum = 0.0;
         float ringValid = 0.0;
+        float darkCount = 0.0;
         for (int ring = 0; ring < 2; ++ring) {
             float ringRadius = RING_START + RING_STEP * float(ring);
             for (int i = 0; i < 8; ++i) {
@@ -109,9 +121,12 @@ void main() {
                 float ins = insideUv(p);
                 vec3 s = texture(uTexture, p).rgb;
                 float m = skinMask(s) * ins;
+                float lS = dot(s, vec3(0.299, 0.587, 0.114));
                 ringSum += s * m;
                 ringW += m;
+                ringLumaSum += lS * m;
                 ringValid += ins;
+                darkCount += ins * step(lS, l0 - DARK_GAP);
             }
         }
         // 1.0 = surrounded by skin (only samples inside the image are counted)
@@ -122,7 +137,6 @@ void main() {
 
         // Local brightness variation. Hair, eyebrows, lashes and beards are
         // strongly textured; skin is smooth. Textured areas get no smoothing.
-        float l0 = dot(centerRaw, vec3(0.299, 0.587, 0.114));
         float sumL = l0;
         float sumL2 = l0 * l0;
         for (int i = 0; i < 8; ++i) {
@@ -141,6 +155,7 @@ void main() {
             // ---- 1. Blemish removal ----
             vec3 roughSkin = ringSum / max(ringW, 0.0001);
             float roughCr = chroma(roughSkin).y;
+            float roughL = ringLumaSum / max(ringW, 0.0001);
 
             // Pass B: same rings, ignoring red outliers (rest of a big pimple).
             vec3 cleanSum = vec3(0.0);
@@ -151,8 +166,13 @@ void main() {
                     vec2 p = uv + dir8(i) * unit * ringRadius;
                     vec3 s = texture(uTexture, p).rgb;
                     float crS = chroma(s).y;
+                    float lS = dot(s, vec3(0.299, 0.587, 0.114));
+                    // Reject red outliers AND samples much darker/brighter than
+                    // the average (brows, hair, lashes, shadows, highlights).
                     float w = skinMask(s) * insideUv(p)
-                            * (1.0 - smoothstep(0.015, 0.040, crS - roughCr));
+                            * (1.0 - smoothstep(SPOT_LOW + 0.002, SPOT_HIGH, crS - roughCr))
+                            * (1.0 - smoothstep(0.03, 0.10, roughL - lS))
+                            * (1.0 - smoothstep(0.12, 0.25, lS - roughL));
                     cleanSum += s * w;
                     cleanW += w;
                 }
@@ -169,16 +189,28 @@ void main() {
                 agree += smoothstep(SPOT_LOW, SPOT_HIGH, chroma(n).y - chroma(localSkin).y);
             }
             agree *= 0.25;
+
+            // Size test (see BLOB_RADIUS): large red areas are not blemishes.
+            float surround = 0.0;
+            for (int i = 0; i < 8; ++i) {
+                vec3 n = texture(uTexture, uv + dir8(i) * unit * BLOB_RADIUS).rgb;
+                surround += smoothstep(SPOT_LOW + 0.004, SPOT_HIGH,
+                                       chroma(n).y - chroma(localSkin).y);
+            }
+            surround *= 0.125;
             // Pimples are about as bright as the skin around them. A big
             // brightness gap means hair/ear/shadow, so do not heal it.
             float lumaGap = abs(dot(centerRaw, vec3(0.299, 0.587, 0.114))
                               - dot(localSkin, vec3(0.299, 0.587, 0.114)));
-            float spot = smoothstep(SPOT_LOW, SPOT_HIGH, redness)
+            float spot = (1.0 - smoothstep(BLOB_LOW, BLOB_HIGH, surround))
+                       * smoothstep(SPOT_LOW, SPOT_HIGH, redness)
                        * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness))
                        * (1.0 - smoothstep(LIP_CR_LOW, LIP_CR_HIGH, centerCr))
                        * smoothstep(0.35, 0.75, agree)
                        * (1.0 - smoothstep(0.12, 0.22, lumaGap))
-                       * (1.0 - smoothstep(HEAL_TEXTURE_LOW, HEAL_TEXTURE_HIGH, lumaStd));
+                       * (1.0 - smoothstep(HEAL_TEXTURE_LOW, HEAL_TEXTURE_HIGH, lumaStd))
+                       * smoothstep(0.5, 0.9, skinMask(localSkin))        // sampled colour must look like skin
+                       * (1.0 - smoothstep(1.0, 4.0, darkCount));         // not next to brows / hair / lashes
             float healAmount = clamp(intensity * 1.6, 0.0, 1.0);
             float keep = spot * healAmount;      // 1 = this pixel is fully healed
             // Keep 20% of the pixel's own brightness so healed spots are not flat.

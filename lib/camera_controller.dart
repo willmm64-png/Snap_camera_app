@@ -43,7 +43,7 @@ class SmoothCameraController extends ChangeNotifier {
 
   // Smoothing filter intensity uniform: [0.0 (off) .. 1.0 (maximum)]
   double _smoothIntensity = 0.75;
-  final double _tanAmount = 0.35;
+  final double _tanAmount = 0.5;
 
   // Zoom control
   double _currentZoom = 1.0;
