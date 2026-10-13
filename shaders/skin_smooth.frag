@@ -12,9 +12,9 @@ out vec4 fragColor;
 // ---------------- Tuning constants ----------------
 // Kernel size is a fraction of image HEIGHT so preview and full-res photo
 // look the same (old code used 1 pixel steps, so photos were barely smoothed).
-const int   RADIUS = 4;
+const int   RADIUS = 3;
 const float KERNEL_UNIT = 0.0016;   // one kernel step = 0.16% of image height
-const float SPATIAL_SIGMA = 2.6;
+const float SPATIAL_SIGMA = 2.0;
 const float RANGE_SIGMA = 0.09;     // lower = more precise edges (eyes/hair/lips kept)
 const float DETAIL_KEEP = 0.20;     // fraction of fine skin texture kept (pores)
 
@@ -27,8 +27,8 @@ const float LIP_CR_LOW = 0.685;     // absolute redness above this is treated as
 const float LIP_CR_HIGH = 0.715;
 // Rings used to sample the surrounding skin. Radius is in kernel steps.
 // Must be bigger than the largest pimple you want removed.
-const float RING_START = 14.0;
-const float RING_STEP = 8.0;
+const float RING_START = 16.0;
+const float RING_STEP = 12.0;
 
 // Smoothing is switched off where local brightness varies more than this
 // (hair, eyebrows, lashes, beard).
@@ -58,6 +58,25 @@ float skinMask(vec3 c) {
     return mCb * mCr * mL;
 }
 
+// 1.0 if the point is inside the image, 0.0 outside. Out-of-image samples must
+// not count as "not skin", or skin near the screen edge would be left unprocessed.
+float insideUv(vec2 p) {
+    return step(0.0, p.x) * step(p.x, 1.0) * step(0.0, p.y) * step(p.y, 1.0);
+}
+
+// 8 unit directions (every 45 degrees). Constant table: much cheaper than cos/sin per tap.
+vec2 dir8(int i) {
+    const float k = 0.70710678;
+    if (i == 0) return vec2(1.0, 0.0);
+    if (i == 1) return vec2(k, k);
+    if (i == 2) return vec2(0.0, 1.0);
+    if (i == 3) return vec2(-k, k);
+    if (i == 4) return vec2(-1.0, 0.0);
+    if (i == 5) return vec2(-k, -k);
+    if (i == 6) return vec2(0.0, -1.0);
+    return vec2(k, -k);
+}
+
 void main() {
     vec2 fragCoord = FlutterFragCoord().xy;
     vec2 uv = fragCoord / uResolution;
@@ -76,24 +95,27 @@ void main() {
 
     if ((intensity > 0.001 || tanAmount > 0.001) && mask > 0.01) {
         // ---- 0. Skin interior check ----
-        // Sample 3 rings around the pixel. If many samples are NOT skin
+        // Sample 2 rings around the pixel. If many samples are NOT skin
         // (hair, ear edge, head outline, background) this pixel is near an
         // edge of the skin area and is left alone. Brown hair and shadowed
         // ears have skin-like colour, so colour alone is not enough.
         vec3 ringSum = vec3(0.0);
         float ringW = 0.0;
-        for (int ring = 0; ring < 3; ++ring) {
+        float ringValid = 0.0;
+        for (int ring = 0; ring < 2; ++ring) {
             float ringRadius = RING_START + RING_STEP * float(ring);
             for (int i = 0; i < 8; ++i) {
-                float a = float(i) * 0.785398;
-                vec2 dir = vec2(cos(a), sin(a));
-                vec3 s = texture(uTexture, uv + dir * unit * ringRadius).rgb;
-                float m = skinMask(s);
+                vec2 p = uv + dir8(i) * unit * ringRadius;
+                float ins = insideUv(p);
+                vec3 s = texture(uTexture, p).rgb;
+                float m = skinMask(s) * ins;
                 ringSum += s * m;
                 ringW += m;
+                ringValid += ins;
             }
         }
-        float coverage = ringW / 24.0;                      // 1.0 = surrounded by skin
+        // 1.0 = surrounded by skin (only samples inside the image are counted)
+        float coverage = (ringValid > 3.0) ? ringW / ringValid : 1.0;
         float interiorSmooth = smoothstep(0.55, 0.85, coverage);
         float interiorTan = smoothstep(0.30, 0.70, coverage);
         float healMask = mask * interiorSmooth;
@@ -104,9 +126,7 @@ void main() {
         float sumL = l0;
         float sumL2 = l0 * l0;
         for (int i = 0; i < 8; ++i) {
-            float a = float(i) * 0.785398;
-            vec2 dir = vec2(cos(a), sin(a));
-            float l = dot(texture(uTexture, uv + dir * unit * 3.0).rgb,
+            float l = dot(texture(uTexture, uv + dir8(i) * unit * 3.0).rgb,
                           vec3(0.299, 0.587, 0.114));
             sumL += l;
             sumL2 += l * l;
@@ -125,23 +145,30 @@ void main() {
             // Pass B: same rings, ignoring red outliers (rest of a big pimple).
             vec3 cleanSum = vec3(0.0);
             float cleanW = 0.0;
-            for (int ring = 0; ring < 3; ++ring) {
+            for (int ring = 0; ring < 2; ++ring) {
                 float ringRadius = RING_START + RING_STEP * float(ring);
                 for (int i = 0; i < 8; ++i) {
-                    float a = float(i) * 0.785398;
-                    vec2 dir = vec2(cos(a), sin(a));
-                    vec3 s = texture(uTexture, uv + dir * unit * ringRadius).rgb;
+                    vec2 p = uv + dir8(i) * unit * ringRadius;
+                    vec3 s = texture(uTexture, p).rgb;
                     float crS = chroma(s).y;
-                    float w = skinMask(s)
+                    float w = skinMask(s) * insideUv(p)
                             * (1.0 - smoothstep(0.015, 0.040, crS - roughCr));
                     cleanSum += s * w;
                     cleanW += w;
                 }
             }
 
-            vec3 localSkin = (cleanW > 2.0) ? cleanSum / cleanW : roughSkin;
+            vec3 localSkin = (cleanW > 1.5) ? cleanSum / cleanW : roughSkin;
             float centerCr = chroma(centerRaw).y;
             float redness = centerCr - chroma(localSkin).y;
+            // A pimple is a blob: neighbours must be red too. Isolated red
+            // pixels (hair speckle, noise) are ignored.
+            float agree = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                vec3 n = texture(uTexture, uv + dir8(i * 2) * unit * 3.0).rgb;
+                agree += smoothstep(SPOT_LOW, SPOT_HIGH, chroma(n).y - chroma(localSkin).y);
+            }
+            agree *= 0.25;
             // Pimples are about as bright as the skin around them. A big
             // brightness gap means hair/ear/shadow, so do not heal it.
             float lumaGap = abs(dot(centerRaw, vec3(0.299, 0.587, 0.114))
@@ -149,14 +176,19 @@ void main() {
             float spot = smoothstep(SPOT_LOW, SPOT_HIGH, redness)
                        * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness))
                        * (1.0 - smoothstep(LIP_CR_LOW, LIP_CR_HIGH, centerCr))
+                       * smoothstep(0.35, 0.75, agree)
                        * (1.0 - smoothstep(0.12, 0.22, lumaGap))
                        * (1.0 - smoothstep(HEAL_TEXTURE_LOW, HEAL_TEXTURE_HIGH, lumaStd));
             float healAmount = clamp(intensity * 1.6, 0.0, 1.0);
             float keep = spot * healAmount;      // 1 = this pixel is fully healed
-            healed = mix(centerRaw, localSkin, keep);
+            // Keep 20% of the pixel's own brightness so healed spots are not flat.
+            float lumaC0 = dot(centerRaw, vec3(0.299, 0.587, 0.114));
+            float lumaL0 = dot(localSkin, vec3(0.299, 0.587, 0.114));
+            vec3 healTarget = clamp(localSkin + vec3((lumaC0 - lumaL0) * 0.2), 0.0, 1.0);
+            healed = mix(centerRaw, healTarget, keep);
 
             // ---- 2. Edge-preserving smoothing (bilateral) ----
-            float stepScale = 1.0 + intensity * 1.2;
+            float stepScale = (1.0 + intensity * 1.2) * 1.33;   // RADIUS 3 needs wider steps
             float twoSpatialSigma2 = 2.0 * SPATIAL_SIGMA * SPATIAL_SIGMA;
             // Range sigma scales with brightness: dark areas have small
             // absolute differences, so a fixed sigma smears dark detail.
@@ -200,7 +232,9 @@ void main() {
             vec3 target = color * TAN_TINT;
             float l = dot(target, vec3(0.2126, 0.7152, 0.0722));
             target = mix(vec3(l), target, 1.1);   // slight saturation boost
-            color = mix(color, target, tanAmount * mask * interiorTan);
+            // Textured areas (hair, brows) get only 30% of the tan.
+            float tanTex = mix(0.3, 1.0, textureOk);
+            color = mix(color, target, tanAmount * mask * interiorTan * tanTex);
         }
     }
 

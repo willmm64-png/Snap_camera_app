@@ -1,5 +1,6 @@
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
+import 'skin_smooth_shader.dart';
 
 /// Processor that applies the skin_smooth.frag fragment shader logic
 /// to high-resolution photo byte arrays.
@@ -36,9 +37,7 @@ class SkinSmoothProcessor {
       final height = sourceImage.height.toDouble();
 
       // 2. Load and compile the skin_smooth.frag FragmentProgram
-      final ui.FragmentProgram program = await ui.FragmentProgram.fromAsset(
-        'shaders/skin_smooth.frag',
-      );
+      final ui.FragmentProgram program = await SkinSmoothShader.load();
       final ui.FragmentShader shader = program.fragmentShader();
 
       // 3. Set shader uniforms:

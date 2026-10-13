@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'camera_screen.dart';
+import 'skin_smooth_shader.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  SkinSmoothShader.preload();
 
   // Lock status bar overlay to light content for dark camera viewfinder
   SystemChrome.setSystemUIOverlayStyle(

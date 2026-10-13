@@ -203,6 +203,9 @@ class SmoothCameraController extends ChangeNotifier {
 
   /// Request both camera and iOS Photos library permissions on startup
   Future<void> requestPermissionsOnStartup() async {
+    // 2. Initialize camera (prompts for camera permission on iOS)
+    await initializeCamera();
+
     try {
       // 1. Request Photos library access on startup
       final hasPhotosAccess = await Gal.hasAccess();
@@ -212,9 +215,6 @@ class SmoothCameraController extends ChangeNotifier {
     } catch (e) {
       debugPrint('Photos permission startup request: $e');
     }
-
-    // 2. Initialize camera (prompts for camera permission on iOS)
-    await initializeCamera();
   }
 
   /// Initialize the front-facing camera (with automatic fallback if front camera is not present)
@@ -251,16 +251,9 @@ class SmoothCameraController extends ChangeNotifier {
 
       await controller.initialize();
 
-      // Retrieve hardware zoom boundaries
-      try {
-        _minZoom = await controller.getMinZoomLevel();
-        _maxZoom = await controller.getMaxZoomLevel();
-        _currentZoom = _minZoom;
-      } catch (_) {
-        _minZoom = 0.5;
-        _maxZoom = 5.0;
-        _currentZoom = 1.0;
-      }
+      _minZoom = 1.0;
+      _maxZoom = 5.0;
+      _currentZoom = 1.0;
 
       // Listen for camera orientation, preview size, and stream changes
       controller.addListener(_onCameraControllerUpdate);
@@ -342,15 +335,9 @@ class SmoothCameraController extends ChangeNotifier {
       await newController.initialize();
       newController.addListener(_onCameraControllerUpdate);
 
-      try {
-        _minZoom = await newController.getMinZoomLevel();
-        _maxZoom = await newController.getMaxZoomLevel();
-        _currentZoom = _minZoom;
-      } catch (_) {
-        _minZoom = 1.0;
-        _maxZoom = 5.0;
-        _currentZoom = 1.0;
-      }
+      _minZoom = 1.0;
+      _maxZoom = 5.0;
+      _currentZoom = 1.0;
 
       await _applyFlashMode();
       _emitCurrentTextureCoordinates();

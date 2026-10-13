@@ -5,6 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
 import 'camera_controller.dart';
+import 'skin_smooth_shader.dart';
 
 /// CustomPainter that renders with the compiled skin_smooth.frag FragmentShader
 /// using live camera texture coordinates and intensity configurations.
@@ -98,9 +99,7 @@ class _ShaderCameraPreviewState extends State<ShaderCameraPreview> {
 
   Future<void> _loadFragmentShader() async {
     try {
-      final program = await ui.FragmentProgram.fromAsset(
-        'shaders/skin_smooth.frag',
-      );
+      final program = await SkinSmoothShader.load();
       if (mounted) {
         setState(() {
           _shader = program.fragmentShader();
