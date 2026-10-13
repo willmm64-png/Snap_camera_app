@@ -30,6 +30,15 @@ const float LIP_CR_HIGH = 0.715;
 const float RING_START = 14.0;
 const float RING_STEP = 8.0;
 
+// Smoothing is switched off where local brightness varies more than this
+// (hair, eyebrows, lashes, beard).
+const float TEXTURE_LOW = 0.045;
+const float TEXTURE_HIGH = 0.090;
+// Blemish healing is also switched off in strongly textured areas (hair),
+// but is more tolerant because a pimple edge also changes brightness.
+const float HEAL_TEXTURE_LOW = 0.030;
+const float HEAL_TEXTURE_HIGH = 0.060;
+
 // Tan: multiplies skin by a warm tint. Strength comes from uTan.
 const vec3 TAN_TINT = vec3(0.95, 0.86, 0.74);
 
@@ -57,6 +66,7 @@ void main() {
     vec3 centerRaw = centerSample.rgb;
     float mask = skinMask(centerRaw);
     float intensity = clamp(uIntensity, 0.0, 1.0);
+    float tanAmount = clamp(uTan, 0.0, 1.0);
 
     // Kernel step in uv units, equal in pixels on both axes.
     float aspect = uResolution.y / uResolution.x;
@@ -64,9 +74,12 @@ void main() {
 
     vec3 color = centerRaw;
 
-    if (intensity > 0.001 && mask > 0.01) {
-        // ---- 1. Blemish removal ----
-        // Pass A: rough average skin colour on 3 rings around the pixel.
+    if ((intensity > 0.001 || tanAmount > 0.001) && mask > 0.01) {
+        // ---- 0. Skin interior check ----
+        // Sample 3 rings around the pixel. If many samples are NOT skin
+        // (hair, ear edge, head outline, background) this pixel is near an
+        // edge of the skin area and is left alone. Brown hair and shadowed
+        // ears have skin-like colour, so colour alone is not enough.
         vec3 ringSum = vec3(0.0);
         float ringW = 0.0;
         for (int ring = 0; ring < 3; ++ring) {
@@ -80,14 +93,36 @@ void main() {
                 ringW += m;
             }
         }
+        float coverage = ringW / 24.0;                      // 1.0 = surrounded by skin
+        float interiorSmooth = smoothstep(0.55, 0.85, coverage);
+        float interiorTan = smoothstep(0.30, 0.70, coverage);
+        float healMask = mask * interiorSmooth;
+
+        // Local brightness variation. Hair, eyebrows, lashes and beards are
+        // strongly textured; skin is smooth. Textured areas get no smoothing.
+        float l0 = dot(centerRaw, vec3(0.299, 0.587, 0.114));
+        float sumL = l0;
+        float sumL2 = l0 * l0;
+        for (int i = 0; i < 8; ++i) {
+            float a = float(i) * 0.785398;
+            vec2 dir = vec2(cos(a), sin(a));
+            float l = dot(texture(uTexture, uv + dir * unit * 3.0).rgb,
+                          vec3(0.299, 0.587, 0.114));
+            sumL += l;
+            sumL2 += l * l;
+        }
+        float meanL = sumL / 9.0;
+        float lumaStd = sqrt(max(sumL2 / 9.0 - meanL * meanL, 0.0));
+        float textureOk = 1.0 - smoothstep(TEXTURE_LOW, TEXTURE_HIGH, lumaStd);
 
         vec3 healed = centerRaw;
-        if (ringW > 6.0) {
-            vec3 roughSkin = ringSum / ringW;
+
+        if (intensity > 0.001 && healMask > 0.01) {
+            // ---- 1. Blemish removal ----
+            vec3 roughSkin = ringSum / max(ringW, 0.0001);
             float roughCr = chroma(roughSkin).y;
 
-            // Pass B: repeat, but ignore samples that are red outliers
-            // (e.g. the rest of a big pimple), so the target is clean skin.
+            // Pass B: same rings, ignoring red outliers (rest of a big pimple).
             vec3 cleanSum = vec3(0.0);
             float cleanW = 0.0;
             for (int ring = 0; ring < 3; ++ring) {
@@ -107,54 +142,66 @@ void main() {
             vec3 localSkin = (cleanW > 2.0) ? cleanSum / cleanW : roughSkin;
             float centerCr = chroma(centerRaw).y;
             float redness = centerCr - chroma(localSkin).y;
+            // Pimples are about as bright as the skin around them. A big
+            // brightness gap means hair/ear/shadow, so do not heal it.
+            float lumaGap = abs(dot(centerRaw, vec3(0.299, 0.587, 0.114))
+                              - dot(localSkin, vec3(0.299, 0.587, 0.114)));
             float spot = smoothstep(SPOT_LOW, SPOT_HIGH, redness)
                        * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness))
-                       * (1.0 - smoothstep(LIP_CR_LOW, LIP_CR_HIGH, centerCr));
+                       * (1.0 - smoothstep(LIP_CR_LOW, LIP_CR_HIGH, centerCr))
+                       * (1.0 - smoothstep(0.12, 0.22, lumaGap))
+                       * (1.0 - smoothstep(HEAL_TEXTURE_LOW, HEAL_TEXTURE_HIGH, lumaStd));
             float healAmount = clamp(intensity * 1.6, 0.0, 1.0);
-            healed = mix(centerRaw, localSkin, spot * healAmount);
-        }
+            float keep = spot * healAmount;      // 1 = this pixel is fully healed
+            healed = mix(centerRaw, localSkin, keep);
 
-        // ---- 2. Edge-preserving smoothing (bilateral) ----
-        float stepScale = 1.0 + intensity * 1.2;
-        float twoSpatialSigma2 = 2.0 * SPATIAL_SIGMA * SPATIAL_SIGMA;
-        float dynRange = RANGE_SIGMA * (0.8 + 0.6 * intensity);
-        float twoRangeSigma2 = 2.0 * dynRange * dynRange;
+            // ---- 2. Edge-preserving smoothing (bilateral) ----
+            float stepScale = 1.0 + intensity * 1.2;
+            float twoSpatialSigma2 = 2.0 * SPATIAL_SIGMA * SPATIAL_SIGMA;
+            // Range sigma scales with brightness: dark areas have small
+            // absolute differences, so a fixed sigma smears dark detail.
+            float lumaC = dot(healed, vec3(0.299, 0.587, 0.114));
+            float dynRange = RANGE_SIGMA * (0.8 + 0.6 * intensity)
+                           * clamp(0.35 + 1.3 * lumaC, 0.5, 1.3);
+            float twoRangeSigma2 = 2.0 * dynRange * dynRange;
 
-        vec3 sumColor = vec3(0.0);
-        float sumWeight = 0.0;
+            vec3 sumColor = vec3(0.0);
+            float sumWeight = 0.0;
 
-        for (int x = -RADIUS; x <= RADIUS; ++x) {
-            for (int y = -RADIUS; y <= RADIUS; ++y) {
-                float d2 = float(x * x + y * y);
-                if (d2 > float(RADIUS * RADIUS) + 0.5) {
-                    continue;
+            for (int x = -RADIUS; x <= RADIUS; ++x) {
+                for (int y = -RADIUS; y <= RADIUS; ++y) {
+                    float d2 = float(x * x + y * y);
+                    if (d2 > float(RADIUS * RADIUS) + 0.5) {
+                        continue;
+                    }
+                    vec2 offset = vec2(float(x), float(y)) * unit * stepScale;
+                    vec3 s = texture(uTexture, uv + offset).rgb;
+                    vec3 diff = s - healed;
+                    float w = exp(-d2 / twoSpatialSigma2)
+                            * exp(-dot(diff, diff) / twoRangeSigma2);
+                    sumColor += s * w;
+                    sumWeight += w;
                 }
-                vec2 offset = vec2(float(x), float(y)) * unit * stepScale;
-                vec3 s = texture(uTexture, uv + offset).rgb;
-                vec3 diff = s - healed;
-                float w = exp(-d2 / twoSpatialSigma2)
-                        * exp(-dot(diff, diff) / twoRangeSigma2);
-                sumColor += s * w;
-                sumWeight += w;
             }
+
+            vec3 smoothed = sumColor / max(sumWeight, 0.0001);
+
+            // Keep a little fine texture so skin does not look plastic.
+            smoothed += (healed - smoothed) * DETAIL_KEEP;
+
+            // Healed pixels skip smoothing: the bilateral kernel only sees the
+            // original red pixels and would blend the pimple straight back in.
+            float smoothAmt = intensity * (1.0 - keep) * textureOk;
+            color = mix(centerRaw, mix(healed, smoothed, smoothAmt), healMask);
         }
 
-        vec3 smoothed = sumColor / max(sumWeight, 0.0001);
-
-        // Keep a little fine texture so skin does not look plastic.
-        smoothed += (healed - smoothed) * DETAIL_KEEP;
-
-        // Apply to skin only.
-        color = mix(healed, smoothed, intensity * mask);
-    }
-
-    // ---- 3. Tan (skin only) ----
-    float tanAmount = clamp(uTan, 0.0, 1.0);
-    if (tanAmount > 0.001 && mask > 0.01) {
-        vec3 target = color * TAN_TINT;
-        float l = dot(target, vec3(0.2126, 0.7152, 0.0722));
-        target = mix(vec3(l), target, 1.1);   // slight saturation boost
-        color = mix(color, target, tanAmount * mask);
+        // ---- 3. Tan (skin only) ----
+        if (tanAmount > 0.001) {
+            vec3 target = color * TAN_TINT;
+            float l = dot(target, vec3(0.2126, 0.7152, 0.0722));
+            target = mix(vec3(l), target, 1.1);   // slight saturation boost
+            color = mix(color, target, tanAmount * mask * interiorTan);
+        }
     }
 
     fragColor = vec4(clamp(color, 0.0, 1.0), centerSample.a);
