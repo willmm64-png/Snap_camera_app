@@ -51,6 +51,13 @@ const float DARK_GAP = 0.20;        // a ring sample this much darker than the p
 // Tan: multiplies skin by a warm tint. Strength comes from uTan.
 const vec3 TAN_TINT = vec3(0.95, 0.86, 0.74);
 
+// Rec.601 luma weights. Every brightness decision in this shader uses them.
+const vec3 LUMA_W = vec3(0.299, 0.587, 0.114);
+
+float luma601(vec3 c) {
+    return dot(c, LUMA_W);
+}
+
 vec2 chroma(vec3 c) {
     float cb = 0.5 - 0.168736 * c.r - 0.331264 * c.g + 0.5 * c.b;
     float cr = 0.5 + 0.5 * c.r - 0.418688 * c.g - 0.081312 * c.b;
@@ -60,7 +67,7 @@ vec2 chroma(vec3 c) {
 // Soft 0..1 skin mask from YCbCr chroma range. Works for light and dark skin.
 float skinMask(vec3 c) {
     vec2 cc = chroma(c);
-    float luma = dot(c, vec3(0.299, 0.587, 0.114));
+    float luma = luma601(c);
     float mCb = smoothstep(0.28, 0.32, cc.x) * (1.0 - smoothstep(0.48, 0.52, cc.x));
     float mCr = smoothstep(0.50, 0.54, cc.y) * (1.0 - smoothstep(0.69, 0.74, cc.y));
     float mL = smoothstep(0.10, 0.20, luma);
@@ -71,6 +78,26 @@ float skinMask(vec3 c) {
 // not count as "not skin", or skin near the screen edge would be left unprocessed.
 float insideUv(vec2 p) {
     return step(0.0, p.x) * step(p.x, 1.0) * step(0.0, p.y) * step(p.y, 1.0);
+}
+
+// Keep a sampling position half a texel inside the image. Out-of-bounds reads
+// are NOT guaranteed to be edge-extended on every GPU backend; where they
+// return transparent black, the black leaked into the output and made dark or
+// see-through patches near the frame edge.
+vec2 clampToImage(vec2 p) {
+    vec2 halfTexel = vec2(0.5) / uResolution;
+    return clamp(p, halfTexel, vec2(1.0) - halfTexel);
+}
+
+// Fetch a texel as straight (non-premultiplied) RGB. The raster handed to an
+// ImageFilter shader is premultiplied, and camera BGRA frames are not
+// guaranteed to carry alpha = 1; dividing restores the true colour so masks
+// and averages stay correct. The 0.25 floor keeps garbage-alpha texels from
+// exploding (premultiplied alpha 0 always means rgb 0 too, so it can only
+// darken a broken texel, never brighten a real one).
+vec3 fetchRgb(vec2 p) {
+    vec4 s = texture(uTexture, p);
+    return s.rgb / max(s.a, 0.25);
 }
 
 // 8 unit directions (every 45 degrees). Constant table: much cheaper than cos/sin per tap.
@@ -88,10 +115,12 @@ vec2 dir8(int i) {
 
 void main() {
     vec2 fragCoord = FlutterFragCoord().xy;
-    vec2 uv = fragCoord / uResolution;
+    // Clamp before sampling: rounding on the last row/column (or a DPR-scaled
+    // filter input) can put uv epsilon outside [0,1]; an out-of-bounds center
+    // tap is transparent black and used to punch see-through holes.
+    vec2 uv = clampToImage(fragCoord / uResolution);
 
-    vec4 centerSample = texture(uTexture, uv);
-    vec3 centerRaw = centerSample.rgb;
+    vec3 centerRaw = fetchRgb(uv);
     float mask = skinMask(centerRaw);
     float intensity = clamp(uIntensity, 0.0, 1.0);
     float tanAmount = clamp(uTan, 0.0, 1.0);
@@ -108,7 +137,7 @@ void main() {
         // (hair, ear edge, head outline, background) this pixel is near an
         // edge of the skin area and is left alone. Brown hair and shadowed
         // ears have skin-like colour, so colour alone is not enough.
-        float l0 = dot(centerRaw, vec3(0.299, 0.587, 0.114));
+        float l0 = luma601(centerRaw);
         vec3 ringSum = vec3(0.0);
         float ringW = 0.0;
         float ringLumaSum = 0.0;
@@ -119,9 +148,9 @@ void main() {
             for (int i = 0; i < 8; ++i) {
                 vec2 p = uv + dir8(i) * unit * ringRadius;
                 float ins = insideUv(p);
-                vec3 s = texture(uTexture, p).rgb;
+                vec3 s = fetchRgb(clampToImage(p));
                 float m = skinMask(s) * ins;
-                float lS = dot(s, vec3(0.299, 0.587, 0.114));
+                float lS = luma601(s);
                 ringSum += s * m;
                 ringW += m;
                 ringLumaSum += lS * m;
@@ -137,13 +166,20 @@ void main() {
 
         // Local brightness variation. Hair, eyebrows, lashes and beards are
         // strongly textured; skin is smooth. Textured areas get no smoothing.
+        // The 4 cardinal taps of this loop are exactly the taps the blemish
+        // "agreement" test needs, so their chroma is summed here for free
+        // instead of fetching them again below.
         float sumL = l0;
         float sumL2 = l0 * l0;
+        float agreeCrSum = 0.0;
         for (int i = 0; i < 8; ++i) {
-            float l = dot(texture(uTexture, uv + dir8(i) * unit * 3.0).rgb,
-                          vec3(0.299, 0.587, 0.114));
+            vec3 s = fetchRgb(clampToImage(uv + dir8(i) * unit * 3.0));
+            float l = luma601(s);
             sumL += l;
             sumL2 += l * l;
+            if (i % 2 == 0) {          // i = 0, 2, 4, 6 are the cardinals
+                agreeCrSum += chroma(s).y;
+            }
         }
         float meanL = sumL / 9.0;
         float lumaStd = sqrt(max(sumL2 / 9.0 - meanL * meanL, 0.0));
@@ -164,9 +200,9 @@ void main() {
                 float ringRadius = RING_START + RING_STEP * float(ring);
                 for (int i = 0; i < 8; ++i) {
                     vec2 p = uv + dir8(i) * unit * ringRadius;
-                    vec3 s = texture(uTexture, p).rgb;
+                    vec3 s = fetchRgb(clampToImage(p));
                     float crS = chroma(s).y;
-                    float lS = dot(s, vec3(0.299, 0.587, 0.114));
+                    float lS = luma601(s);
                     // Reject red outliers AND samples much darker/brighter than
                     // the average (brows, hair, lashes, shadows, highlights).
                     float w = skinMask(s) * insideUv(p)
@@ -179,29 +215,26 @@ void main() {
             }
 
             vec3 localSkin = (cleanW > 1.5) ? cleanSum / cleanW : roughSkin;
+            float localCr = chroma(localSkin).y;
             float centerCr = chroma(centerRaw).y;
-            float redness = centerCr - chroma(localSkin).y;
+            float redness = centerCr - localCr;
             // A pimple is a blob: neighbours must be red too. Isolated red
-            // pixels (hair speckle, noise) are ignored.
-            float agree = 0.0;
-            for (int i = 0; i < 4; ++i) {
-                vec3 n = texture(uTexture, uv + dir8(i * 2) * unit * 3.0).rgb;
-                agree += smoothstep(SPOT_LOW, SPOT_HIGH, chroma(n).y - chroma(localSkin).y);
-            }
-            agree *= 0.25;
+            // pixels (hair speckle, noise) are ignored. The neighbour taps
+            // were already fetched in the luma-variation loop above.
+            float agree = smoothstep(SPOT_LOW, SPOT_HIGH,
+                                     agreeCrSum * 0.25 - localCr);
 
             // Size test (see BLOB_RADIUS): large red areas are not blemishes.
             float surround = 0.0;
             for (int i = 0; i < 8; ++i) {
-                vec3 n = texture(uTexture, uv + dir8(i) * unit * BLOB_RADIUS).rgb;
+                vec3 n = fetchRgb(clampToImage(uv + dir8(i) * unit * BLOB_RADIUS));
                 surround += smoothstep(SPOT_LOW + 0.004, SPOT_HIGH,
-                                       chroma(n).y - chroma(localSkin).y);
+                                       chroma(n).y - localCr);
             }
             surround *= 0.125;
             // Pimples are about as bright as the skin around them. A big
             // brightness gap means hair/ear/shadow, so do not heal it.
-            float lumaGap = abs(dot(centerRaw, vec3(0.299, 0.587, 0.114))
-                              - dot(localSkin, vec3(0.299, 0.587, 0.114)));
+            float lumaGap = abs(luma601(centerRaw) - luma601(localSkin));
             float spot = (1.0 - smoothstep(BLOB_LOW, BLOB_HIGH, surround))
                        * smoothstep(SPOT_LOW, SPOT_HIGH, redness)
                        * (1.0 - smoothstep(SPOT_MAX_LOW, SPOT_MAX_HIGH, redness))
@@ -214,8 +247,8 @@ void main() {
             float healAmount = clamp(intensity * 1.6, 0.0, 1.0);
             float keep = spot * healAmount;      // 1 = this pixel is fully healed
             // Keep 20% of the pixel's own brightness so healed spots are not flat.
-            float lumaC0 = dot(centerRaw, vec3(0.299, 0.587, 0.114));
-            float lumaL0 = dot(localSkin, vec3(0.299, 0.587, 0.114));
+            float lumaC0 = luma601(centerRaw);
+            float lumaL0 = luma601(localSkin);
             vec3 healTarget = clamp(localSkin + vec3((lumaC0 - lumaL0) * 0.2), 0.0, 1.0);
             healed = mix(centerRaw, healTarget, keep);
 
@@ -224,7 +257,7 @@ void main() {
             float twoSpatialSigma2 = 2.0 * SPATIAL_SIGMA * SPATIAL_SIGMA;
             // Range sigma scales with brightness: dark areas have small
             // absolute differences, so a fixed sigma smears dark detail.
-            float lumaC = dot(healed, vec3(0.299, 0.587, 0.114));
+            float lumaC = luma601(healed);
             float dynRange = RANGE_SIGMA * (0.8 + 0.6 * intensity)
                            * clamp(0.35 + 1.3 * lumaC, 0.5, 1.3);
             float twoRangeSigma2 = 2.0 * dynRange * dynRange;
@@ -238,8 +271,8 @@ void main() {
                     if (d2 > float(RADIUS * RADIUS) + 0.5) {
                         continue;
                     }
-                    vec2 offset = vec2(float(x), float(y)) * unit * stepScale;
-                    vec3 s = texture(uTexture, uv + offset).rgb;
+                    vec2 p = clampToImage(uv + vec2(float(x), float(y)) * unit * stepScale);
+                    vec3 s = fetchRgb(p);
                     vec3 diff = s - healed;
                     float w = exp(-d2 / twoSpatialSigma2)
                             * exp(-dot(diff, diff) / twoRangeSigma2);
@@ -262,6 +295,7 @@ void main() {
         // ---- 3. Tan (skin only) ----
         if (tanAmount > 0.001) {
             vec3 target = color * TAN_TINT;
+            // Rec.709 luma here on purpose: the tan tint was tuned with it.
             float l = dot(target, vec3(0.2126, 0.7152, 0.0722));
             target = mix(vec3(l), target, 1.1);   // slight saturation boost
             // Textured areas (hair, brows) get only 30% of the tan.
@@ -270,5 +304,8 @@ void main() {
         }
     }
 
-    fragColor = vec4(clamp(color, 0.0, 1.0), centerSample.a);
+    // Always fully opaque: this filter runs on a camera feed / photo, which
+    // have no transparency. Forwarding the input alpha is what let patches of
+    // skin turn see-through whenever a texel arrived with alpha < 1.
+    fragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }
