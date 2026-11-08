@@ -27,7 +27,7 @@ class _CameraScreenState extends State<CameraScreen>
   void initState() {
     super.initState();
     _cameraController = SmoothCameraController();
-    _cameraController.requestPermissionsOnStartup();
+    _cameraController.initializeOnStartup();
 
     _shutterAnimController = AnimationController(
       vsync: this,
@@ -296,7 +296,7 @@ class _CameraScreenState extends State<CameraScreen>
             ),
             const SizedBox(height: 24),
             ElevatedButton(
-              onPressed: () => _cameraController.requestPermissionsOnStartup(),
+              onPressed: () => _cameraController.initializeOnStartup(),
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.white,
                 foregroundColor: Colors.black,

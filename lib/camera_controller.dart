@@ -201,20 +201,12 @@ class SmoothCameraController extends ChangeNotifier {
     }
   }
 
-  /// Request both camera and iOS Photos library permissions on startup
-  Future<void> requestPermissionsOnStartup() async {
-    // 2. Initialize camera (prompts for camera permission on iOS)
+  /// Initialize the camera on startup (prompts for the camera permission on
+  /// iOS). Photos library access is deliberately not requested here: it is
+  /// checked on the first capture instead, so startup shows a single
+  /// permission dialog and the fresh preview is not covered by a second one.
+  Future<void> initializeOnStartup() async {
     await initializeCamera();
-
-    try {
-      // 1. Request Photos library access on startup
-      final hasPhotosAccess = await Gal.hasAccess();
-      if (!hasPhotosAccess) {
-        await Gal.requestAccess();
-      }
-    } catch (e) {
-      debugPrint('Photos permission startup request: $e');
-    }
   }
 
   /// Initialize the front-facing camera (with automatic fallback if front camera is not present)
@@ -244,7 +236,6 @@ class SmoothCameraController extends ChangeNotifier {
         _frontCamera!,
         ResolutionPreset.high,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.bgra8888,
       );
 
       _controller = controller;
@@ -329,7 +320,6 @@ class SmoothCameraController extends ChangeNotifier {
         nextCamera,
         ResolutionPreset.high,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.bgra8888,
       );
       _controller = newController;
       await newController.initialize();
