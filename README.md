@@ -1,6 +1,6 @@
 # Snap Camera
 
-This is an implementation of the snap camera in ios.
+This is a small and lightweight app that adds a neutralizing filter on faces.
 
 ## Getting Started
 
